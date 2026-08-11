@@ -1,0 +1,1 @@
+A user uploads a CSV, Sentinel validates each row against a set of rules, stores the valid rows, quarantines the invalid ones with a reason, and exposes both through an API.
