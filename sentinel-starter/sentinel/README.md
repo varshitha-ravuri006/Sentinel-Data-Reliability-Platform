@@ -8,7 +8,7 @@ Stack: FastAPI · PostgreSQL · Docker Compose · pytest
 
 ---
 
-## Run it (Day 1 definition of done)
+## Run it 
 
 ```bash
 # 1. Copy the env template and set a local password
@@ -41,9 +41,9 @@ app/
 ├── api/          # (Sem 1) FastAPI routers — thin, no business logic
 ├── services/     # (Sem 1) validation engine + rule types — the brain
 ├── repositories/ # (Sem 1) all DB access
-├── core/         # config + db session  ✅ done
-├── models/       # SQLAlchemy tables     ✅ done
-└── tests/        # pytest                ✅ started
+├── core/         # config + db session  
+├── models/       # SQLAlchemy tables     
+└── tests/        # pytest                
 ```
 
 ## Security
@@ -51,11 +51,6 @@ app/
 `.env` is gitignored from commit #1. **Never commit real credentials or API
 keys.** Config is loaded from environment variables via `app/core/config.py`.
 
-## Role split
-
-Pair on this Docker/skeleton setup together, then split:
-
-- **Person A** — validation engine + rule types + tests (the brain) + data model
-- **Person B** — API layer + CSV upload/ingestion + report endpoint + this README + dashboard
-
-Swap PR reviewers every time, so both of you understand the whole system.
+#What each file does?
+**app/schemas/contracts.py** — defines the agreed shapes: what a Rule looks like going in, and what a ValidationResult looks like coming out.
+***app/services/engine.py*** — the engine: a registry of rules plus validate(), which runs every rule on every row and tallies the result.
