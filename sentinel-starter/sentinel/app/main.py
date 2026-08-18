@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import Base, engine, get_db
 from app.models import tables  # noqa: F401  (registers models with Base)
-
+from fastapi import FastAPI, UploadFile, File
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -24,3 +24,6 @@ def health(db: Session = Depends(get_db)):
     """Liveness + DB connectivity check."""
     db.execute(text("SELECT 1"))
     return {"status": "ok", "database": "connected"}
+@app.post("/upload")
+async def upload_csv(file: UploadFile = File(...)):
+    return {"filename": file.filename}
