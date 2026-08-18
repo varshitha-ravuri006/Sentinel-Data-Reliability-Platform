@@ -52,5 +52,7 @@ app/
 keys.** Config is loaded from environment variables via `app/core/config.py`.
 
 #What each file does?
+
 **app/schemas/contracts.py** — defines the agreed shapes: what a Rule looks like going in, and what a ValidationResult looks like coming out.
 ***app/services/engine.py*** — the engine: a registry of rules plus validate(), which runs every rule on every row and tallies the result.
+***tests***-running tests update if any code broke,written using pytest.
