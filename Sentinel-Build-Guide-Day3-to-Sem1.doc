@@ -1,0 +1,1214 @@
+# Sentinel — Build Guide: Day 3 → End of Semester 1
+
+This guide takes the project from the Day-2 state (working validation engine)
+to a complete, deployed Semester-1 platform with a dashboard. It contains **both
+people's work** so you can split up and keep moving in parallel.
+
+- **Person A** = spine: orchestration, `/validate`, reporting, the harder rules, CI, deploy.
+- **Person B** = ingestion: file upload, the simpler rules, contract API, quarantine view, test data, dashboard.
+
+## How to read this guide
+
+- **File: `path`** — the file to work in. **Create** = new file, **Replace** =
+  overwrite the whole file, **Edit** = change part of it.
+- **Paste in VS Code** = code goes in a file. **Run in terminal** = a command in
+  the PowerShell terminal (in the project folder).
+- Each day ends with a **Checkpoint** (how you know it's done) and **Commit** steps.
+
+## Project structure you should have after this guide
+
+```
+sentinel/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── .env  /  .env.example
+├── .github/workflows/ci.yml        (Day 7)
+├── static/index.html               (Day 8-9)
+└── app/
+    ├── main.py
+    ├── core/        config.py, db.py
+    ├── models/      tables.py
+    ├── schemas/     contracts.py
+    ├── services/    engine.py, orchestrator.py
+    ├── api/         upload.py, validation.py, rules.py, datasets.py
+    └── tests/       test_health.py, test_engine.py, test_validate.py, ...
+```
+
+## Git workflow (both of you, every day)
+
+Work on a branch, push, open a Pull Request, review each other, merge. Never both
+edit the same lines. Before starting each day: `git pull` to get the latest.
+
+```powershell
+git checkout -b day3-yourname
+# ...work...
+git add .
+git commit -m "Day 3: <what you did>"
+git push -u origin day3-yourname
+# open a Pull Request on GitHub, get it reviewed, merge
+```
+
+**One shared-file coordination rule:** the `RULES` dictionary in
+`app/services/engine.py` is edited by both of you (each adds rule functions).
+To avoid conflicts, Person A owns the `validate()` function and the final `RULES`
+dict; Person B adds rule *functions* and tells A which keys to register. Keep rule
+functions small and independent.
+
+---
+
+# DAY 3 — The join: upload data in, validate it, store results
+
+**Goal:** the pipeline runs end to end for the first time. A dataset's rows go
+through the engine and land in `valid_records` / `quarantine`.
+
+No new installs today.
+
+## Person A — orchestration + `/validate` + storage
+
+### A1. Add the landing-zone table
+
+**File: `app/models/tables.py`** — **Edit**: add this class at the bottom
+(all imports it needs are already at the top of the file).
+
+```python
+class RawRecord(Base):
+    """A row exactly as uploaded, before validation. The landing zone."""
+    __tablename__ = "raw_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id"))
+    row_number: Mapped[int] = mapped_column(Integer)
+    data: Mapped[dict] = mapped_column(JSONB)
+```
+
+### A2. The orchestrator (chains the stages together)
+
+**File: `app/services/orchestrator.py`** — **Create**.
+
+```python
+from sqlalchemy.orm import Session
+
+from app.models.tables import (
+    Dataset, ValidationRule, RawRecord, ValidRecord, Quarantine,
+)
+from app.schemas.contracts import Rule
+from app.services.engine import validate
+
+
+def validate_dataset(db: Session, dataset_id: int) -> dict:
+    # 1. Load the dataset
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if dataset is None:
+        raise ValueError(f"Dataset {dataset_id} not found")
+
+    # 2. Load its rules (the data contract) as engine Rule objects
+    rule_rows = (
+        db.query(ValidationRule)
+        .filter(ValidationRule.dataset_name == dataset.name)
+        .all()
+    )
+    rules = [
+        Rule(column=r.column_name, rule_type=r.rule_type, params=r.rule_params or {})
+        for r in rule_rows
+    ]
+
+    # 3. Load the raw rows uploaded for this dataset
+    raw_rows = (
+        db.query(RawRecord).filter(RawRecord.dataset_id == dataset_id).all()
+    )
+    rows = [r.data for r in raw_rows]
+
+    # 4. Run the engine (Day 2 code)
+    result = validate(rows, rules)
+
+    # 5. Clear previous results so re-running is safe (idempotent)
+    db.query(ValidRecord).filter(ValidRecord.dataset_id == dataset_id).delete()
+    db.query(Quarantine).filter(Quarantine.dataset_id == dataset_id).delete()
+
+    # 6. Store good rows
+    for i, row in enumerate(result.valid_rows):
+        db.add(ValidRecord(dataset_id=dataset_id, row_number=i, data=row))
+
+    # 7. Store bad rows with reasons
+    for bad in result.invalid_rows:
+        db.add(Quarantine(
+            dataset_id=dataset_id,
+            row_number=bad.row_number,
+            data=bad.data,
+            failure_reasons=[r.model_dump() for r in bad.reasons],
+        ))
+
+    # 8. Update the dataset summary
+    dataset.total_rows = result.total_rows
+    dataset.valid_rows = result.valid_count
+    dataset.invalid_rows = result.invalid_count
+    dataset.health_score = result.health_score
+    dataset.status = "validated"
+
+    db.commit()
+    return {
+        "dataset_id": dataset_id,
+        "total_rows": result.total_rows,
+        "valid": result.valid_count,
+        "invalid": result.invalid_count,
+        "health_score": result.health_score,
+    }
+```
+
+### A3. The endpoint
+
+**File: `app/api/__init__.py`** — **Create** (empty file).
+
+**File: `app/api/validation.py`** — **Create**.
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from app.core.db import get_db
+from app.services.orchestrator import validate_dataset
+
+router = APIRouter(prefix="/datasets", tags=["validation"])
+
+
+@router.post("/{dataset_id}/validate")
+def run_validation(dataset_id: int, db: Session = Depends(get_db)):
+    try:
+        return validate_dataset(db, dataset_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+```
+
+### A4. Register the router
+
+**File: `app/main.py`** — **Edit**: add the import near the other imports, and
+the `include_router` line just after `app = FastAPI(...)`.
+
+```python
+from app.api.validation import router as validation_router
+```
+```python
+app.include_router(validation_router)
+```
+
+### A5. Test it
+
+**File: `app/tests/test_validate.py`** — **Create**.
+
+```python
+from app.core.db import SessionLocal
+from app.models.tables import (
+    Dataset, ValidationRule, RawRecord, ValidRecord, Quarantine,
+)
+from app.services.orchestrator import validate_dataset
+
+
+def test_validate_dataset_sorts_and_stores():
+    db = SessionLocal()
+    try:
+        ds = Dataset(name="orders_test", source_filename="test.csv")
+        db.add(ds); db.commit(); db.refresh(ds)
+
+        db.add(ValidationRule(
+            dataset_name="orders_test", column_name="customer_id",
+            rule_type="not_null", rule_params={},
+        ))
+        db.add_all([
+            RawRecord(dataset_id=ds.id, row_number=0, data={"order_id": "1", "customer_id": "C1"}),
+            RawRecord(dataset_id=ds.id, row_number=1, data={"order_id": "2", "customer_id": ""}),
+            RawRecord(dataset_id=ds.id, row_number=2, data={"order_id": "3", "customer_id": "C3"}),
+        ])
+        db.commit()
+
+        summary = validate_dataset(db, ds.id)
+        assert summary["total_rows"] == 3
+        assert summary["valid"] == 2
+        assert summary["invalid"] == 1
+
+        assert db.query(ValidRecord).filter(ValidRecord.dataset_id == ds.id).count() == 2
+        assert db.query(Quarantine).filter(Quarantine.dataset_id == ds.id).count() == 1
+
+        db.refresh(ds)
+        assert ds.status == "validated"
+        assert ds.health_score == 66.67
+    finally:
+        db.query(RawRecord).filter(RawRecord.dataset_id == ds.id).delete()
+        db.query(ValidRecord).filter(ValidRecord.dataset_id == ds.id).delete()
+        db.query(Quarantine).filter(Quarantine.dataset_id == ds.id).delete()
+        db.query(ValidationRule).filter(ValidationRule.dataset_name == "orders_test").delete()
+        db.query(Dataset).filter(Dataset.id == ds.id).delete()
+        db.commit(); db.close()
+```
+
+## Person B — CSV upload (ingestion)
+
+### B1. The upload endpoint
+
+**File: `app/api/upload.py`** — **Create**.
+
+```python
+import csv
+import io
+
+from fastapi import APIRouter, Depends, File, UploadFile
+from sqlalchemy.orm import Session
+
+from app.core.db import get_db
+from app.models.tables import Dataset, RawRecord
+
+router = APIRouter(prefix="/datasets", tags=["ingestion"])
+
+
+@router.post("/upload")
+async def upload_dataset(
+    name: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    content = await file.read()
+    text = content.decode("utf-8")
+    rows = list(csv.DictReader(io.StringIO(text)))
+
+    dataset = Dataset(
+        name=name, source_filename=file.filename,
+        total_rows=len(rows), status="uploaded",
+    )
+    db.add(dataset); db.commit(); db.refresh(dataset)
+
+    for i, row in enumerate(rows):
+        db.add(RawRecord(dataset_id=dataset.id, row_number=i, data=dict(row)))
+    db.commit()
+
+    return {"dataset_id": dataset.id, "name": name, "rows_ingested": len(rows)}
+```
+
+### B2. Register the router
+
+**File: `app/main.py`** — **Edit**: add (coordinate with Person A so both routers
+are registered):
+
+```python
+from app.api.upload import router as upload_router
+```
+```python
+app.include_router(upload_router)
+```
+
+### B3. Test the upload
+
+**File: `app/tests/test_upload.py`** — **Create**.
+
+```python
+import io
+from fastapi.testclient import TestClient
+from app.main import app
+from app.core.db import SessionLocal
+from app.models.tables import Dataset, RawRecord
+
+client = TestClient(app)
+
+
+def test_upload_ingests_rows():
+    csv_data = "order_id,customer_id\n1,C1\n2,C2\n3,C3\n"
+    files = {"file": ("test.csv", io.BytesIO(csv_data.encode()), "text/csv")}
+    resp = client.post("/datasets/upload?name=upload_test", files=files)
+    assert resp.status_code == 200
+    assert resp.json()["rows_ingested"] == 3
+
+    db = SessionLocal()
+    try:
+        ds = db.query(Dataset).filter(Dataset.name == "upload_test").first()
+        assert db.query(RawRecord).filter(RawRecord.dataset_id == ds.id).count() == 3
+    finally:
+        db.query(RawRecord).filter(RawRecord.dataset_id == ds.id).delete()
+        db.query(Dataset).filter(Dataset.id == ds.id).delete()
+        db.commit(); db.close()
+```
+
+## Day 3 — Run & Checkpoint
+
+**Run in terminal:**
+```powershell
+docker compose up -d --build
+docker compose exec app pytest -q
+```
+
+**Checkpoint (done when):**
+- `raw_records` table exists; `/datasets/upload` and `/datasets/{id}/validate` show in `/docs`.
+- Full manual flow in `/docs`: upload a CSV → copy the returned `dataset_id` →
+  (you'll need a rule; until the rules API exists on Day 5, the validate test proves
+  storage works on seeded data) → validate → good/bad rows stored.
+- All tests green: `test_health`, `test_engine`, `test_validate`, `test_upload`.
+
+**Commit:** both push your branches, review, merge.
+
+---
+
+# DAY 4 — All six validation rules
+
+**Goal:** the engine supports all six rule types, each with a test.
+
+No new installs.
+
+## Person A — replace the engine with the full version
+
+The new `validate()` handles `unique` specially, because uniqueness is
+**column-global** (it depends on the whole column), unlike the other rules which
+are **row-local**. Understand this — it's a great interview point.
+
+**File: `app/services/engine.py`** — **Replace** the whole file with:
+
+```python
+"""The validation engine.
+
+Row-local rules are functions (value, params) -> error string | None,
+registered in RULES. The 'unique' rule is column-global and handled specially
+inside validate().
+"""
+import re
+from datetime import datetime
+
+from app.schemas.contracts import (
+    InvalidRow, Rule, RowFailure, ValidationResult,
+)
+
+
+# ---- row-local rule functions ----
+
+def _not_null(value, params):
+    if value is None or value == "":
+        return "value is required"
+    return None
+
+
+def _positive(value, params):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return "must be a number"
+    if n <= 0:
+        return "must be greater than 0"
+    return None
+
+
+def _in_set(value, params):
+    allowed = params.get("allowed", [])
+    if value not in allowed:
+        return f"must be one of {allowed}"
+    return None
+
+
+def _valid_date(value, params):
+    fmt = params.get("format", "%Y-%m-%d")
+    if value is None or value == "":
+        return "date is required"
+    try:
+        datetime.strptime(value, fmt)
+    except (TypeError, ValueError):
+        return f"must be a valid date ({fmt})"
+    return None
+
+
+def _regex(value, params):
+    pattern = params.get("pattern", "")
+    if value is None or not re.match(pattern, str(value)):
+        return "does not match required pattern"
+    return None
+
+
+# The registry of row-local rules. ('unique' is handled in validate().)
+RULES = {
+    "not_null": _not_null,
+    "positive": _positive,
+    "in_set": _in_set,
+    "valid_date": _valid_date,
+    "regex": _regex,
+}
+
+
+def validate(rows: list[dict], rules: list[Rule]) -> ValidationResult:
+    # Pre-compute duplicate values for any 'unique' rules (column-global).
+    unique_dupes: dict[str, set] = {}
+    for rule in rules:
+        if rule.rule_type == "unique":
+            seen: dict = {}
+            for row in rows:
+                v = row.get(rule.column)
+                seen[v] = seen.get(v, 0) + 1
+            unique_dupes[rule.column] = {v for v, c in seen.items() if c > 1}
+
+    valid_rows: list[dict] = []
+    invalid_rows: list[InvalidRow] = []
+
+    for i, row in enumerate(rows):
+        reasons: list[RowFailure] = []
+        for rule in rules:
+            value = row.get(rule.column)
+            if rule.rule_type == "unique":
+                if value in unique_dupes.get(rule.column, set()):
+                    reasons.append(RowFailure(
+                        column=rule.column, rule_type="unique",
+                        detail="duplicate value",
+                    ))
+                continue
+            check = RULES.get(rule.rule_type)
+            if check is None:
+                continue
+            error = check(value, rule.params)
+            if error is not None:
+                reasons.append(RowFailure(
+                    column=rule.column, rule_type=rule.rule_type, detail=error,
+                ))
+        if reasons:
+            invalid_rows.append(InvalidRow(row_number=i, data=row, reasons=reasons))
+        else:
+            valid_rows.append(row)
+
+    total = len(rows)
+    valid_count = len(valid_rows)
+    invalid_count = len(invalid_rows)
+    health = round(100 * valid_count / total, 2) if total else 0.0
+
+    return ValidationResult(
+        total_rows=total, valid_count=valid_count, invalid_count=invalid_count,
+        health_score=health, valid_rows=valid_rows, invalid_rows=invalid_rows,
+    )
+```
+
+> Note: CSV values arrive as **strings**, which is why `_positive` and
+> `_valid_date` convert/parse rather than assuming a number or date.
+
+## Person B — add rule tests
+
+**File: `app/tests/test_rules.py`** — **Create**. (You own the tests for the
+simpler rules; Person A owns tests for date/unique/regex — put them here together.)
+
+```python
+from app.schemas.contracts import Rule
+from app.services.engine import validate
+
+
+def _run(rows, rules):
+    return validate(rows, rules)
+
+
+def test_positive():
+    rows = [{"amount": "5"}, {"amount": "-3"}, {"amount": "0"}, {"amount": "x"}]
+    r = _run(rows, [Rule(column="amount", rule_type="positive")])
+    assert r.valid_count == 1        # only "5"
+    assert r.invalid_count == 3
+
+
+def test_in_set():
+    rows = [{"status": "paid"}, {"status": "unknown"}]
+    rule = Rule(column="status", rule_type="in_set",
+                params={"allowed": ["pending", "paid", "shipped", "cancelled"]})
+    r = _run(rows, [rule])
+    assert r.valid_count == 1
+    assert r.invalid_count == 1
+
+
+def test_valid_date():
+    rows = [{"d": "2024-01-15"}, {"d": "not-a-date"}, {"d": ""}]
+    r = _run(rows, [Rule(column="d", rule_type="valid_date")])
+    assert r.valid_count == 1
+    assert r.invalid_count == 2
+
+
+def test_regex_email():
+    rows = [{"email": "a@b.com"}, {"email": "nope"}]
+    rule = Rule(column="email", rule_type="regex",
+                params={"pattern": r"[^@]+@[^@]+\.[^@]+"})
+    r = _run(rows, [rule])
+    assert r.valid_count == 1
+
+
+def test_unique():
+    rows = [{"id": "1"}, {"id": "2"}, {"id": "1"}]  # "1" duplicated
+    r = _run(rows, [Rule(column="id", rule_type="unique")])
+    assert r.invalid_count == 2       # both rows with id "1"
+    assert r.valid_count == 1
+```
+
+## Day 4 — Run & Checkpoint
+
+```powershell
+docker compose up -d --build
+docker compose exec app pytest -q
+```
+
+**Checkpoint:** all six rule types pass their tests; engine handles string inputs
+and the column-global `unique` rule correctly.
+
+**Commit:** push, review, merge. (Coordinate on `engine.py` so you don't both edit it.)
+
+---
+
+# DAY 5 — Contract API + reporting + quarantine view
+
+**Goal:** define contracts through the API, see a health report, and browse
+quarantined rows.
+
+No new installs.
+
+## Person B — rules (contract) CRUD + quarantine endpoint
+
+**File: `app/api/rules.py`** — **Create**.
+
+```python
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.core.db import get_db
+from app.models.tables import ValidationRule
+
+router = APIRouter(prefix="/rules", tags=["contracts"])
+
+
+class RuleIn(BaseModel):
+    dataset_name: str
+    column_name: str
+    rule_type: str
+    rule_params: dict = {}
+
+
+@router.post("")
+def create_rule(rule: RuleIn, db: Session = Depends(get_db)):
+    r = ValidationRule(**rule.model_dump())
+    db.add(r); db.commit(); db.refresh(r)
+    return {"id": r.id}
+
+
+@router.get("")
+def list_rules(dataset: str, db: Session = Depends(get_db)):
+    rows = db.query(ValidationRule).filter(
+        ValidationRule.dataset_name == dataset).all()
+    return [
+        {"id": r.id, "column": r.column_name,
+         "rule_type": r.rule_type, "params": r.rule_params}
+        for r in rows
+    ]
+
+
+@router.delete("/{rule_id}")
+def delete_rule(rule_id: int, db: Session = Depends(get_db)):
+    db.query(ValidationRule).filter(ValidationRule.id == rule_id).delete()
+    db.commit()
+    return {"deleted": rule_id}
+```
+
+**File: `app/api/validation.py`** — **Edit**: add the quarantine endpoint to the
+existing router.
+
+```python
+from app.models.tables import Quarantine
+
+
+@router.get("/{dataset_id}/quarantine")
+def quarantine(dataset_id: int, limit: int = 50, offset: int = 0,
+               db: Session = Depends(get_db)):
+    rows = (db.query(Quarantine)
+            .filter(Quarantine.dataset_id == dataset_id)
+            .offset(offset).limit(limit).all())
+    return [
+        {"row_number": r.row_number, "data": r.data, "reasons": r.failure_reasons}
+        for r in rows
+    ]
+```
+
+## Person A — report endpoint + datasets list + register rules router
+
+**File: `app/api/validation.py`** — **Edit**: add the report endpoint (needs
+`Dataset` and `Quarantine` imports at the top).
+
+```python
+from app.models.tables import Dataset
+
+
+@router.get("/{dataset_id}/report")
+def report(dataset_id: int, db: Session = Depends(get_db)):
+    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if ds is None:
+        raise HTTPException(status_code=404, detail="dataset not found")
+
+    quarantined = db.query(Quarantine).filter(
+        Quarantine.dataset_id == dataset_id).all()
+    counter: dict = {}
+    for q in quarantined:
+        for reason in q.failure_reasons:
+            key = f"{reason['column']} · {reason['rule_type']}"
+            counter[key] = counter.get(key, 0) + 1
+    most_common = max(counter, key=counter.get) if counter else None
+
+    return {
+        "dataset": ds.name, "total_rows": ds.total_rows,
+        "valid": ds.valid_rows, "invalid": ds.invalid_rows,
+        "health_score": ds.health_score, "status": ds.status,
+        "most_common_error": most_common,
+    }
+```
+
+**File: `app/api/datasets.py`** — **Create** (a simple list endpoint).
+
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.core.db import get_db
+from app.models.tables import Dataset
+
+router = APIRouter(prefix="/datasets", tags=["datasets"])
+
+
+@router.get("")
+def list_datasets(db: Session = Depends(get_db)):
+    rows = db.query(Dataset).all()
+    return [
+        {"id": d.id, "name": d.name, "status": d.status,
+         "total_rows": d.total_rows, "health_score": d.health_score}
+        for d in rows
+    ]
+```
+
+**File: `app/main.py`** — **Edit**: register the two new routers.
+
+```python
+from app.api.rules import router as rules_router
+from app.api.datasets import router as datasets_router
+```
+```python
+app.include_router(rules_router)
+app.include_router(datasets_router)
+```
+
+## Day 5 — Run & full manual test
+
+```powershell
+docker compose up -d --build
+docker compose exec app pytest -q
+```
+
+Then in the browser at `http://localhost:8000/docs`, run the **whole flow by hand**:
+1. `POST /datasets/upload?name=orders` with a CSV → note the `dataset_id`.
+2. `POST /rules` a few times to define the contract for `orders`
+   (e.g. `customer_id` not_null, `amount` positive, `status` in_set).
+3. `POST /datasets/{id}/validate`.
+4. `GET /datasets/{id}/report` → see counts + health score + most common error.
+5. `GET /datasets/{id}/quarantine` → see the bad rows with reasons.
+
+**Checkpoint:** the entire pipeline works end to end through the API. This is the
+core Semester-1 deliverable functioning.
+
+**Commit:** push, review, merge.
+
+---
+
+# DAY 6 — Robustness & end-to-end integration
+
+**Goal:** handle errors gracefully and prove the full flow with an automated test.
+
+No new installs.
+
+## Person A — end-to-end integration test
+
+**File: `app/tests/test_end_to_end.py`** — **Create**.
+
+```python
+import io
+from fastapi.testclient import TestClient
+from app.main import app
+from app.core.db import SessionLocal
+from app.models.tables import (
+    Dataset, ValidationRule, RawRecord, ValidRecord, Quarantine,
+)
+
+client = TestClient(app)
+
+
+def test_full_pipeline():
+    name = "e2e_orders"
+    csv_data = (
+        "order_id,customer_id,amount,status\n"
+        "1,C1,10,paid\n"
+        "2,,20,paid\n"          # bad: missing customer_id
+        "3,C3,-5,paid\n"        # bad: negative amount
+        "4,C4,40,unknown\n"     # bad: status not in set
+        "5,C5,50,shipped\n"
+    )
+    files = {"file": ("o.csv", io.BytesIO(csv_data.encode()), "text/csv")}
+    up = client.post(f"/datasets/upload?name={name}", files=files)
+    dsid = up.json()["dataset_id"]
+
+    for col, rt, params in [
+        ("customer_id", "not_null", {}),
+        ("amount", "positive", {}),
+        ("status", "in_set", {"allowed": ["pending", "paid", "shipped", "cancelled"]}),
+    ]:
+        client.post("/rules", json={
+            "dataset_name": name, "column_name": col,
+            "rule_type": rt, "rule_params": params,
+        })
+
+    client.post(f"/datasets/{dsid}/validate")
+    report = client.get(f"/datasets/{dsid}/report").json()
+    assert report["total_rows"] == 5
+    assert report["valid"] == 2
+    assert report["invalid"] == 3
+
+    # cleanup
+    db = SessionLocal()
+    try:
+        db.query(RawRecord).filter(RawRecord.dataset_id == dsid).delete()
+        db.query(ValidRecord).filter(ValidRecord.dataset_id == dsid).delete()
+        db.query(Quarantine).filter(Quarantine.dataset_id == dsid).delete()
+        db.query(ValidationRule).filter(ValidationRule.dataset_name == name).delete()
+        db.query(Dataset).filter(Dataset.id == dsid).delete()
+        db.commit()
+    finally:
+        db.close()
+```
+
+## Person B — input validation & error handling
+
+**File: `app/api/upload.py`** — **Edit**: guard against non-CSV and empty files.
+
+```python
+from fastapi import HTTPException
+```
+Replace the body of `upload_dataset` up to creating rows with:
+```python
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only .csv files are supported")
+    content = await file.read()
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 text")
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV has no data rows")
+```
+
+**File: `scripts/seed_demo.py`** — **Create** (a helper to load a demo dataset +
+contract for the review). Run it from inside the container.
+
+```python
+"""Seed a demo 'orders' dataset with a contract, for the demo."""
+import csv, io
+from app.core.db import SessionLocal
+from app.models.tables import Dataset, RawRecord, ValidationRule
+
+CSV = (
+    "order_id,customer_id,amount,status\n"
+    "1,C1,10,paid\n2,,20,paid\n3,C3,-5,paid\n4,C4,40,unknown\n5,C5,50,shipped\n"
+)
+
+def main():
+    db = SessionLocal()
+    rows = list(csv.DictReader(io.StringIO(CSV)))
+    ds = Dataset(name="demo_orders", source_filename="demo.csv",
+                 total_rows=len(rows), status="uploaded")
+    db.add(ds); db.commit(); db.refresh(ds)
+    for i, r in enumerate(rows):
+        db.add(RawRecord(dataset_id=ds.id, row_number=i, data=dict(r)))
+    for col, rt, p in [("customer_id","not_null",{}),("amount","positive",{}),
+                       ("status","in_set",{"allowed":["pending","paid","shipped","cancelled"]})]:
+        db.add(ValidationRule(dataset_name="demo_orders", column_name=col,
+                              rule_type=rt, rule_params=p))
+    db.commit(); db.close()
+    print(f"Seeded demo_orders with id {ds.id}")
+
+if __name__ == "__main__":
+    main()
+```
+
+## Day 6 — Run & Checkpoint
+
+```powershell
+docker compose up -d --build
+docker compose exec app pytest -q
+docker compose exec app python -m scripts.seed_demo
+```
+
+**Checkpoint:** end-to-end test passes; bad files are rejected with clear errors;
+a demo dataset can be seeded on demand.
+
+**Commit:** push, review, merge.
+
+---
+
+# DAY 7 — Test data generator + CI
+
+**Goal:** generate realistic corrupted data with known answers, and run tests
+automatically on every push.
+
+**Install:** add `faker` to the project.
+
+**File: `requirements.txt`** — **Edit**: add a line:
+```
+faker>=25,<30
+```
+
+## Person B — Faker corrupted-data generator
+
+**File: `scripts/generate_data.py`** — **Create**.
+
+```python
+"""Generate a CSV with a known number of corrupted rows, for testing/demo."""
+import csv, random, sys
+from faker import Faker
+
+fake = Faker()
+
+def generate(path: str, n: int = 200, corrupt_ratio: float = 0.2) -> int:
+    rows = []
+    for i in range(n):
+        rows.append({
+            "order_id": str(i + 1),
+            "customer_id": f"C{random.randint(1, 60)}",
+            "amount": str(random.randint(1, 500)),
+            "status": random.choice(["pending", "paid", "shipped", "cancelled"]),
+            "order_date": fake.date(),
+        })
+    n_bad = int(n * corrupt_ratio)
+    for row in random.sample(rows, n_bad):
+        field = random.choice(["customer_id", "amount", "status"])
+        if field == "customer_id":
+            row["customer_id"] = ""
+        elif field == "amount":
+            row["amount"] = str(-random.randint(1, 50))
+        else:
+            row["status"] = "unknown"
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+    print(f"Wrote {n} rows to {path} ({n_bad} corrupted)")
+    return n_bad
+
+if __name__ == "__main__":
+    generate(sys.argv[1] if len(sys.argv) > 1 else "sample.csv")
+```
+
+Run it (inside container) to produce a demo file you can upload:
+```powershell
+docker compose exec app python -m scripts.generate_data sample.csv
+```
+
+## Person A — GitHub Actions CI
+
+**File: `.github/workflows/ci.yml`** — **Create**.
+
+```yaml
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: sentinel
+          POSTGRES_DB: sentinel
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sentinel"
+          --health-interval 5s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+        env:
+          DATABASE_URL: postgresql+psycopg2://sentinel:sentinel@localhost:5432/sentinel
+```
+
+## Day 7 — Checkpoint
+
+```powershell
+docker compose up -d --build
+docker compose exec app pytest -q
+```
+Push a branch and open a PR — the CI job should run and go green on GitHub
+(check the "Actions" tab). Add a line to the README: "CI: tests run on every PR."
+
+**Checkpoint:** CI passes on GitHub; a realistic corrupted CSV can be generated.
+
+**Commit:** push, review, merge.
+
+---
+
+# DAY 8 — Dashboard (part 1): serve it & wire upload
+
+**Goal:** a simple web page (no framework) that uploads a CSV to the API.
+
+No new installs (plain HTML + JavaScript served by FastAPI).
+
+## Person A — serve static files + enable CORS
+
+**File: `app/main.py`** — **Edit**: add CORS and static mounting.
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+```
+After `app = FastAPI(...)`:
+```python
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"],
+    allow_methods=["*"], allow_headers=["*"],
+)
+app.mount("/ui", StaticFiles(directory="static", html=True), name="ui")
+```
+
+**File: `Dockerfile`** — **Edit**: copy the static folder into the image. Add,
+before the `CMD` line:
+```dockerfile
+COPY ./static ./static
+```
+
+## Person B — the dashboard page
+
+**File: `static/index.html`** — **Create**.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Sentinel Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; color: #222; }
+    h1 { color: #8C1D40; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 6px 10px; font-size: 14px; text-align: left; }
+    th { background: #8C1D40; color: #fff; }
+    button { background: #8C1D40; color: #fff; border: 0; padding: 8px 14px; border-radius: 6px; cursor: pointer; }
+    .score { font-size: 28px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Sentinel — Data Reliability</h1>
+
+  <div class="card">
+    <h3>1. Upload a CSV</h3>
+    <input type="text" id="name" placeholder="dataset name" value="orders" />
+    <input type="file" id="file" accept=".csv" />
+    <button onclick="upload()">Upload</button>
+    <p id="uploadMsg"></p>
+  </div>
+
+  <div class="card">
+    <h3>2. Validate</h3>
+    <p>Dataset id: <span id="dsid">—</span></p>
+    <button onclick="validate()">Run validation</button>
+  </div>
+
+  <div class="card" id="reportCard" style="display:none">
+    <h3>Report</h3>
+    <p class="score" id="score"></p>
+    <p id="counts"></p>
+    <p id="common"></p>
+    <h4>Quarantined rows</h4>
+    <div id="quarantine"></div>
+  </div>
+
+  <script>
+    const API = window.location.origin;   // same server
+    let datasetId = null;
+
+    async function upload() {
+      const name = document.getElementById('name').value;
+      const file = document.getElementById('file').files[0];
+      if (!file) { alert('Choose a CSV first'); return; }
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch(`${API}/datasets/upload?name=${encodeURIComponent(name)}`, {
+        method: 'POST', body: fd,
+      });
+      const data = await res.json();
+      datasetId = data.dataset_id;
+      document.getElementById('dsid').textContent = datasetId;
+      document.getElementById('uploadMsg').textContent =
+        `Ingested ${data.rows_ingested} rows.`;
+    }
+
+    async function validate() {
+      if (!datasetId) { alert('Upload first'); return; }
+      await fetch(`${API}/datasets/${datasetId}/validate`, { method: 'POST' });
+      const report = await (await fetch(`${API}/datasets/${datasetId}/report`)).json();
+      const q = await (await fetch(`${API}/datasets/${datasetId}/quarantine`)).json();
+
+      document.getElementById('reportCard').style.display = 'block';
+      document.getElementById('score').textContent = `Health: ${report.health_score}%`;
+      document.getElementById('counts').textContent =
+        `Total ${report.total_rows} · Valid ${report.valid} · Invalid ${report.invalid}`;
+      document.getElementById('common').textContent =
+        `Most common error: ${report.most_common_error || 'none'}`;
+
+      let html = '<table><tr><th>Row</th><th>Data</th><th>Reasons</th></tr>';
+      for (const row of q) {
+        const reasons = row.reasons.map(r => `${r.column}: ${r.detail}`).join('; ');
+        html += `<tr><td>${row.row_number}</td><td>${JSON.stringify(row.data)}</td><td>${reasons}</td></tr>`;
+      }
+      html += '</table>';
+      document.getElementById('quarantine').innerHTML = html;
+    }
+  </script>
+</body>
+</html>
+```
+
+## Day 8 — Run & Checkpoint
+
+```powershell
+docker compose up -d --build
+```
+Open `http://localhost:8000/ui/` — you should see the dashboard. Upload works
+(validation needs a contract; on Day 9 we add a way to define it from the UI or
+rely on the seeded demo).
+
+**Checkpoint:** dashboard loads and can upload a CSV.
+
+**Commit:** push, review, merge.
+
+---
+
+# DAY 9 — Dashboard (part 2): full demo flow + polish
+
+**Goal:** the dashboard shows a complete result (score, counts, quarantine) for a
+dataset that has a contract.
+
+No new installs.
+
+## Person B — make the demo path smooth
+
+Two easy options; pick one:
+
+- **Option 1 (simplest for the demo):** seed the demo dataset + contract with the
+  Day-6 script, then in the dashboard add an input to type an existing
+  `dataset_id` and just click "Run validation." Add near the Validate card:
+  ```html
+  <input type="number" id="manualId" placeholder="existing dataset id" />
+  <button onclick="useId()">Use this id</button>
+  <script>
+    function useId() {
+      datasetId = document.getElementById('manualId').value;
+      document.getElementById('dsid').textContent = datasetId;
+    }
+  </script>
+  ```
+- **Option 2 (nicer):** add a small "Add rule" form to the dashboard that POSTs to
+  `/rules` (dataset_name, column, rule_type, params) so a contract can be defined
+  in the UI before validating.
+
+## Person A — final polish & demo rehearsal
+
+- Confirm the full path works from a clean start:
+  ```powershell
+  docker compose down
+  docker compose up -d --build
+  docker compose exec app python -m scripts.seed_demo
+  ```
+  Then open `http://localhost:8000/ui/`, use the seeded `demo_orders` id, run
+  validation, and confirm score + quarantine display.
+- Fix any rough edges (empty states, error messages).
+
+## Day 9 — Checkpoint
+
+**Checkpoint:** from a clean `docker compose up`, you can demo the whole product
+in the browser: upload/seed → validate → see health score and quarantined rows
+with reasons.
+
+**Commit:** push, review, merge.
+
+---
+
+# DAY 10 — Deploy to the cloud + final demo
+
+**Goal:** the app is live on a public URL for the faculty demo, on free tiers.
+
+> Cloud dashboards change their wording often — follow each platform's current
+> setup wizard; the steps below are the shape of what to do.
+
+## Person A — database on Neon + app on Render
+
+### 1. Database (Neon — free, permanent)
+- Create a Neon account and a new project. Copy the connection string.
+- Convert it to SQLAlchemy form: it should start with
+  `postgresql+psycopg2://` (add `+psycopg2` after `postgresql` if needed) and end
+  with `?sslmode=require`.
+
+### 2. Make the app production-startable
+**File: `Dockerfile`** — **Edit**: the dev `CMD` uses `--reload` and a fixed port.
+For cloud, bind to the platform's `$PORT`. Change the `CMD` to:
+```dockerfile
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+```
+
+### 3. App host (Render — free)
+- New → Web Service → connect your GitHub repo.
+- Environment: **Docker**.
+- Add an environment variable `DATABASE_URL` = your Neon SQLAlchemy string.
+- Deploy. Render builds the image and runs it; your app comes up at a public URL.
+- Because `Base.metadata.create_all` runs on startup, the tables are created in
+  Neon automatically on first boot.
+
+## Person B — finalize README + demo assets
+
+**File: `README.md`** — **Edit**: ensure it has run instructions (local + live URL),
+the architecture summary, the tech stack, and a short "How to demo" section:
+1. Open the live URL `/ui/`.
+2. Upload `sample.csv` (from `scripts/generate_data.py`) or use the seeded demo.
+3. Validate → show health score and quarantine.
+
+Also generate a fresh demo file to have ready:
+```powershell
+docker compose exec app python -m scripts.generate_data sample.csv
+```
+
+## Day 10 — Final checkpoint (Semester 1 complete)
+
+- [ ] Live public URL works; `/docs` and `/ui/` both load.
+- [ ] Upload → validate → report → quarantine works on the deployed app.
+- [ ] All tests green locally and in CI.
+- [ ] README explains how to run and how to demo.
+- [ ] `git tag v1.0` and push, to mark the Semester-1 release:
+  ```powershell
+  git tag v1.0
+  git push origin v1.0
+  ```
+
+**You now have a complete, deployed Semester-1 deliverable:** a data reliability
+platform that ingests CSVs, validates them against declarative contracts,
+separates valid from quarantined rows with reasons, scores dataset health, exposes
+it all over a REST API, shows it in a dashboard, is tested with CI, and runs live
+in the cloud.
+
+---
+
+## Quick reference — who owns what
+
+| Area | Person A | Person B |
+|---|---|---|
+| Engine core (`validate`, registry) | ✅ owns | adds rule functions |
+| Rules: date, unique, regex | ✅ | |
+| Rules: not_null, positive, in_set | | ✅ |
+| Orchestrator + `/validate` | ✅ | |
+| Upload / ingestion | | ✅ |
+| Report + datasets list | ✅ | |
+| Rules API + quarantine view | | ✅ |
+| CI (GitHub Actions) | ✅ | |
+| Test-data generator (Faker) | | ✅ |
+| Dashboard | serve + CORS | ✅ page |
+| Deploy (Render + Neon) | ✅ | README + demo |
+
+Swap PR reviews both ways so you each understand the whole system before the review.
