@@ -3,6 +3,8 @@ from app.api.validation import router as validation_router
 from fastapi import Depends, FastAPI
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from app.api.rules import router as rules_router
+from app.api.datasets import router as datasets_router
 
 from app.core.db import Base, engine, get_db
 from app.models import tables  # noqa: F401  (registers models with Base)
@@ -18,6 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Sentinel", version="0.1.0", lifespan=lifespan)
 app.include_router(validation_router)
+app.include_router(rules_router)
+app.include_router(datasets_router)
 
 
 @app.get("/health", tags=["system"])
