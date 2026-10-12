@@ -3,7 +3,17 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.services.orchestrator import validate_dataset
-from app.models.tables import Dataset
+from app.models.tables import Dataset, Quarantine
+
+router = APIRouter(prefix="/datasets", tags=["validation"])
+
+
+@router.post("/{dataset_id}/validate")
+def run_validation(dataset_id: int, db: Session = Depends(get_db)):
+    try:
+        return validate_dataset(db, dataset_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/{dataset_id}/report")
@@ -27,12 +37,16 @@ def report(dataset_id: int, db: Session = Depends(get_db)):
         "health_score": ds.health_score, "status": ds.status,
         "most_common_error": most_common,
     }
-router = APIRouter(prefix="/datasets", tags=["validation"])
 
 
-@router.post("/{dataset_id}/validate")
-def run_validation(dataset_id: int, db: Session = Depends(get_db)):
-    try:
-        return validate_dataset(db, dataset_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+@router.get("/{dataset_id}/quarantine")
+def quarantine(dataset_id: int, limit: int = 50, offset: int = 0,
+               db: Session = Depends(get_db)):
+    rows = (db.query(Quarantine)
+            .filter(Quarantine.dataset_id == dataset_id)
+            .order_by(Quarantine.row_number)
+            .offset(offset).limit(limit).all())
+    return [
+        {"row_number": r.row_number, "data": r.data, "reasons": r.failure_reasons}
+        for r in rows
+    ]

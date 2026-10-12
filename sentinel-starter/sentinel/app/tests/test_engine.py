@@ -24,3 +24,39 @@ def test_not_null_splits_valid_and_invalid():
     assert result.valid_count == 3
     assert result.invalid_count == 2
     assert result.health_score == 60.0
+def test_positive_splits_valid_and_invalid():
+    rows = [
+        {"order_id": "1", "amount": "50"},
+        {"order_id": "2", "amount": "-5"},    # not positive
+        {"order_id": "3", "amount": "10"},
+        {"order_id": "4", "amount": "0"},     # not positive (zero fails)
+        {"order_id": "5", "amount": "abc"},   # not numeric
+    ]
+    rules = [Rule(column="amount", rule_type="positive")]
+    result = validate(rows, rules)
+    assert result.total_rows == 5
+    assert result.valid_count == 2
+    assert result.invalid_count == 3
+    assert result.health_score == 40.0
+
+
+def test_in_set_splits_valid_and_invalid():
+    rows = [
+        {"order_id": "1", "status": "paid"},
+        {"order_id": "2", "status": "unknown"},   # not allowed
+        {"order_id": "3", "status": "pending"},
+        {"order_id": "4", "status": "shipped"},
+        {"order_id": "5", "status": "refunded"},  # not allowed
+    ]
+    rules = [
+        Rule(
+            column="status",
+            rule_type="in_set",
+            params={"allowed": ["pending", "paid", "shipped", "cancelled"]},
+        )
+    ]
+    result = validate(rows, rules)
+    assert result.total_rows == 5
+    assert result.valid_count == 3
+    assert result.invalid_count == 2
+    assert round(result.health_score, 2) == 60.0
