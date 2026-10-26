@@ -25,3 +25,14 @@ def test_upload_ingests_rows():
         db.query(Dataset).filter(Dataset.id == ds.id).delete()
         db.commit()
         db.close()
+def test_upload_rejects_non_csv():
+    files = {"file": ("notes.txt", io.BytesIO(b"hello"), "text/plain")}
+    resp = client.post("/datasets/upload?name=bad_type", files=files)
+    assert resp.status_code == 400
+
+
+def test_upload_rejects_empty_csv():
+    files = {"file": ("empty.csv", io.BytesIO(b"order_id,customer_id\n"), "text/csv")}
+    resp = client.post("/datasets/upload?name=empty_test", files=files)
+    assert resp.status_code == 400
+

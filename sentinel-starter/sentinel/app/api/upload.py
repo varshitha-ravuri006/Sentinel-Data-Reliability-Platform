@@ -1,7 +1,7 @@
 import csv
 import io
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
@@ -16,9 +16,18 @@ async def upload_dataset(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
+    if not (file.filename or "").lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only .csv files are supported")
+
     content = await file.read()
-    text = content.decode("utf-8")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 text")
+
     rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV has no data rows")
 
     dataset = Dataset(
         name=name,
