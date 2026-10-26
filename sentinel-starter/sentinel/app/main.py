@@ -9,6 +9,8 @@ from app.api.datasets import router as datasets_router
 from app.core.db import Base, engine, get_db
 from app.models import tables  # noqa: F401  (registers models with Base)
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -19,6 +21,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Sentinel", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"],
+    allow_methods=["*"], allow_headers=["*"],
+)
+app.mount("/ui", StaticFiles(directory="static", html=True), name="ui")
 app.include_router(validation_router)
 app.include_router(rules_router)
 app.include_router(datasets_router)
