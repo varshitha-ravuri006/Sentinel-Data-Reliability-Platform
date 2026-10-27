@@ -78,9 +78,8 @@ class Quarantine(Base):
     dataset: Mapped["Dataset"] = relationship(back_populates="quarantined")
 class RawRecord(Base):
     """A row exactly as uploaded, before validation.The landing zone."""
-    __tablename__="raw_records"
-    id:Mapped[int]=mapped_column(primary_key=True)
-    dataset_id:Mapped[int]=mapped_column(ForeignKey("datasets.id"))
-    row_number:Mapped[int]=mapped_column(Integer)
-    data:Mapped[dict]= mapped_column(JSONB)
-    
+    __tablename__ = "raw_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id"))
+    row_number: Mapped[int] = mapped_column(Integer)
+    data: Mapped[dict] = mapped_column(JSONB)

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sentinel Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { color: #8C1D40; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 6px 10px; font-size: 14px; text-align: left; vertical-align: top; }
+    th { background: #8C1D40; color: #fff; }
+    button { background: #8C1D40; color: #fff; border: 0; padding: 8px 14px; border-radius: 6px; cursor: pointer; }
+    .score { font-size: 28px; font-weight: bold; }
+    .err { color: #b00020; }
+    #quarantine { overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>Sentinel — Data Reliability</h1>
+
+  <div class="card">
+    <h3>1. Upload a CSV</h3>
+    <input type="text" id="name" placeholder="dataset name" value="orders" />
+    <input type="file" id="file" accept=".csv" />
+    <button onclick="upload()">Upload</button>
+    <p id="uploadMsg"></p>
+  </div>
+
+  <div class="card">
+    <h3>2. Validate</h3>
+    <p>Dataset id: <span id="dsid">—</span></p>
+    <button onclick="validate()">Run validation</button>
+    <p id="validateMsg"></p>
+  </div>
+
+  <div class="card" id="reportCard" style="display:none">
+    <h3>Report</h3>
+    <p class="score" id="score"></p>
+    <p id="counts"></p>
+    <p id="common"></p>
+    <h4>Quarantined rows</h4>
+    <div id="quarantine"></div>
+  </div>
+
+  <script>
+    const API = window.location.origin;   // same server that serves this page
+    let datasetId = null;
+
+    // escape user data before putting it into the page
+    function esc(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    async function upload() {
+      const msg = document.getElementById('uploadMsg');
+      msg.className = '';
+      const name = document.getElementById('name').value.trim();
+      const file = document.getElementById('file').files[0];
+      if (!name) { msg.textContent = 'Enter a dataset name.'; return; }
+      if (!file) { msg.textContent = 'Choose a CSV first.'; return; }
+
+      const fd = new FormData();
+      fd.append('file', file);
+      try {
+        const res = await fetch(`${API}/datasets/upload?name=${encodeURIComponent(name)}`, {
+          method: 'POST', body: fd,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          msg.className = 'err';
+          msg.textContent = data.detail || 'Upload failed.';
+          return;
+        }
+        datasetId = data.dataset_id;
+        document.getElementById('dsid').textContent = datasetId;
+        msg.textContent = `Ingested ${data.rows_ingested} rows.`;
+      } catch (e) {
+        msg.className = 'err';
+        msg.textContent = 'Could not reach the server.';
+      }
+    }
+
+    async function validate() {
+      const msg = document.getElementById('validateMsg');
+      msg.className = '';
+      msg.textContent = '';
+      if (!datasetId) { msg.textContent = 'Upload a file first.'; return; }
+      try {
+        const v = await fetch(`${API}/datasets/${datasetId}/validate`, { method: 'POST' });
+        if (!v.ok) {
+          msg.className = 'err';
+          msg.textContent = 'Validation failed.';
+          return;
+        }
+        const report = await (await fetch(`${API}/datasets/${datasetId}/report`)).json();
+        const q = await (await fetch(`${API}/datasets/${datasetId}/quarantine`)).json();
+
+        document.getElementById('reportCard').style.display = 'block';
+        document.getElementById('score').textContent = `Health: ${report.health_score}%`;
+        document.getElementById('counts').textContent =
+          `Total ${report.total_rows} · Valid ${report.valid} · Invalid ${report.invalid}`;
+        document.getElementById('common').textContent =
+          `Most common error: ${report.most_common_error || 'none'}`;
+
+        if (q.length === 0) {
+          document.getElementById('quarantine').textContent = 'No quarantined rows.';
+          return;
+        }
+        let html = '<table><tr><th>Row</th><th>Data</th><th>Reasons</th></tr>';
+        for (const row of q) {
+          const reasons = row.reasons.map(r => `${r.column}: ${r.detail}`).join('; ');
+          html += `<tr><td>${row.row_number}</td><td>${esc(JSON.stringify(row.data))}</td><td>${esc(reasons)}</td></tr>`;
+        }
+        html += '</table>';
+        document.getElementById('quarantine').innerHTML = html;
+      } catch (e) {
+        msg.className = 'err';
+        msg.textContent = 'Could not reach the server.';
+      }
+    }
+  </script>
+</body>
+</html>

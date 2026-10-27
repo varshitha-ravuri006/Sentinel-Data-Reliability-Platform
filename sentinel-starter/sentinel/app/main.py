@@ -1,16 +1,18 @@
 from contextlib import asynccontextmanager
-from app.api.validation import router as validation_router
-from fastapi import Depends, FastAPI
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-from app.api.rules import router as rules_router
-from app.api.datasets import router as datasets_router
 
-from app.core.db import Base, engine, get_db
-from app.models import tables  # noqa: F401  (registers models with Base)
-from fastapi import FastAPI, UploadFile, File
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.api.datasets import router as datasets_router
+from app.api.rules import router as rules_router
+from app.api.upload import router as upload_router
+from app.api.validation import router as validation_router
+from app.core.db import Base, engine, get_db
+from app.models import tables  # noqa: F401  (registers models with Base)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -25,10 +27,11 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"],
     allow_methods=["*"], allow_headers=["*"],
 )
-app.mount("/ui", StaticFiles(directory="static", html=True), name="ui")
 app.include_router(validation_router)
 app.include_router(rules_router)
+app.include_router(upload_router)
 app.include_router(datasets_router)
+app.mount("/ui", StaticFiles(directory="static", html=True), name="ui")
 
 
 @app.get("/health", tags=["system"])
@@ -36,6 +39,3 @@ def health(db: Session = Depends(get_db)):
     """Liveness + DB connectivity check."""
     db.execute(text("SELECT 1"))
     return {"status": "ok", "database": "connected"}
-@app.post("/upload")
-async def upload_csv(file: UploadFile = File(...)):
-    return {"filename": file.filename}
