@@ -14,4 +14,4 @@ def list_datasets(db: Session = Depends(get_db)):
         {"id": d.id, "name": d.name, "status": d.status,
          "total_rows": d.total_rows, "health_score": d.health_score}
         for d in rows
-    ]
+    ]  
