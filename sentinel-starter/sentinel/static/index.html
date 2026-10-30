@@ -12,26 +12,61 @@
     th, td { border: 1px solid #ddd; padding: 6px 10px; font-size: 14px; text-align: left; vertical-align: top; }
     th { background: #8C1D40; color: #fff; }
     button { background: #8C1D40; color: #fff; border: 0; padding: 8px 14px; border-radius: 6px; cursor: pointer; }
+    button.small { padding: 3px 8px; font-size: 12px; }
+    input, select { padding: 6px; margin: 2px 0; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .score { font-size: 28px; font-weight: bold; }
     .err { color: #b00020; }
-    #quarantine { overflow-x: auto; }
+    .ok { color: #1b6e2d; }
+    .hint { color: #666; font-size: 13px; }
+    .scroll { overflow-x: auto; }
   </style>
 </head>
 <body>
   <h1>Sentinel — Data Reliability</h1>
 
   <div class="card">
-    <h3>1. Upload a CSV</h3>
-    <input type="text" id="name" placeholder="dataset name" value="orders" />
+    <h3>Dataset name</h3>
+    <input type="text" id="name" value="orders" onchange="loadRules()" />
+    <span class="hint">Rules are attached to this name, and the upload uses it too.</span>
+  </div>
+
+  <div class="card">
+    <h3>1. Define the contract (rules)</h3>
+    <div class="row">
+      <input type="text" id="column" placeholder="column, e.g. amount" />
+      <select id="ruleType" onchange="fillExample()">
+        <option>not_null</option>
+        <option>positive</option>
+        <option>in_set</option>
+        <option>valid_date</option>
+        <option>unique</option>
+        <option>regex</option>
+      </select>
+      <input type="text" id="params" value="{}" size="38" />
+      <button onclick="addRule()">Add rule</button>
+    </div>
+    <p class="hint">Params are JSON. in_set needs allowed, regex needs pattern, valid_date takes an optional format.</p>
+    <p id="ruleMsg"></p>
+    <div id="rulesList" class="scroll"></div>
+  </div>
+
+  <div class="card">
+    <h3>2. Upload a CSV</h3>
     <input type="file" id="file" accept=".csv" />
     <button onclick="upload()">Upload</button>
     <p id="uploadMsg"></p>
   </div>
 
   <div class="card">
-    <h3>2. Validate</h3>
+    <h3>3. Validate</h3>
     <p>Dataset id: <span id="dsid">—</span></p>
     <button onclick="validate()">Run validation</button>
+    <p class="hint">Already have a dataset (e.g. from the seed script)? Enter its id:</p>
+    <div class="row">
+      <input type="number" id="manualId" placeholder="existing dataset id" />
+      <button class="small" onclick="useId()">Use this id</button>
+    </div>
     <p id="validateMsg"></p>
   </div>
 
@@ -41,85 +76,166 @@
     <p id="counts"></p>
     <p id="common"></p>
     <h4>Quarantined rows</h4>
-    <div id="quarantine"></div>
+    <div id="quarantine" class="scroll"></div>
   </div>
 
   <script>
     const API = window.location.origin;   // same server that serves this page
     let datasetId = null;
+    const $ = (id) => document.getElementById(id);
+
+    const EXAMPLES = {
+      not_null: '{}',
+      positive: '{}',
+      unique: '{}',
+      in_set: '{"allowed": ["pending", "paid", "shipped", "cancelled"]}',
+      valid_date: '{"format": "%Y-%m-%d"}',
+      regex: '{"pattern": "^C[0-9]+$"}',
+    };
 
     // escape user data before putting it into the page
     function esc(s) {
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
-    async function upload() {
-      const msg = document.getElementById('uploadMsg');
-      msg.className = '';
-      const name = document.getElementById('name').value.trim();
-      const file = document.getElementById('file').files[0];
-      if (!name) { msg.textContent = 'Enter a dataset name.'; return; }
-      if (!file) { msg.textContent = 'Choose a CSV first.'; return; }
+    // turn an API error response into a readable message
+    async function readError(res, fallback) {
+      try {
+        const d = await res.json();
+        if (typeof d.detail === 'string') return d.detail;
+        if (Array.isArray(d.detail)) return d.detail.map((x) => x.msg).join('; ');
+      } catch (e) { /* not JSON */ }
+      return fallback;
+    }
 
+    function say(id, text, cls) {
+      const el = $(id);
+      el.className = cls || '';
+      el.textContent = text;
+    }
+
+    function fillExample() {
+      $('params').value = EXAMPLES[$('ruleType').value] || '{}';
+    }
+
+    // ---------- contract (rules) ----------
+    async function loadRules() {
+      const name = $('name').value.trim();
+      const box = $('rulesList');
+      if (!name) { box.textContent = ''; return; }
+      try {
+        const res = await fetch(`${API}/rules?dataset=${encodeURIComponent(name)}`);
+        if (!res.ok) { box.textContent = 'Could not load rules.'; return; }
+        const rules = await res.json();
+        if (rules.length === 0) { box.textContent = 'No rules yet for this dataset.'; return; }
+        let html = '<table><tr><th>Column</th><th>Rule</th><th>Params</th><th></th></tr>';
+        for (const r of rules) {
+          html += `<tr><td>${esc(r.column)}</td><td>${esc(r.rule_type)}</td>` +
+                  `<td>${esc(JSON.stringify(r.params))}</td>` +
+                  `<td><button class="small" onclick="delRule(${Number(r.id)})">Delete</button></td></tr>`;
+        }
+        box.innerHTML = html + '</table>';
+      } catch (e) {
+        box.textContent = 'Could not reach the server.';
+      }
+    }
+
+    async function addRule() {
+      const name = $('name').value.trim();
+      const column = $('column').value.trim();
+      if (!name) { say('ruleMsg', 'Enter a dataset name.', 'err'); return; }
+      if (!column) { say('ruleMsg', 'Enter a column name.', 'err'); return; }
+      let params;
+      try { params = JSON.parse($('params').value || '{}'); }
+      catch (e) { say('ruleMsg', 'Params must be valid JSON.', 'err'); return; }
+      try {
+        const res = await fetch(`${API}/rules`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dataset_name: name, column_name: column,
+            rule_type: $('ruleType').value, rule_params: params,
+          }),
+        });
+        if (!res.ok) { say('ruleMsg', await readError(res, 'Could not add rule.'), 'err'); return; }
+        say('ruleMsg', 'Rule added.', 'ok');
+        loadRules();
+      } catch (e) {
+        say('ruleMsg', 'Could not reach the server.', 'err');
+      }
+    }
+
+    async function delRule(id) {
+      try {
+        await fetch(`${API}/rules/${id}`, { method: 'DELETE' });
+        loadRules();
+      } catch (e) {
+        say('ruleMsg', 'Could not reach the server.', 'err');
+      }
+    }
+
+    // ---------- upload ----------
+    async function upload() {
+      const name = $('name').value.trim();
+      const file = $('file').files[0];
+      if (!name) { say('uploadMsg', 'Enter a dataset name.', 'err'); return; }
+      if (!file) { say('uploadMsg', 'Choose a CSV first.', 'err'); return; }
       const fd = new FormData();
       fd.append('file', file);
       try {
         const res = await fetch(`${API}/datasets/upload?name=${encodeURIComponent(name)}`, {
           method: 'POST', body: fd,
         });
+        if (!res.ok) { say('uploadMsg', await readError(res, 'Upload failed.'), 'err'); return; }
         const data = await res.json();
-        if (!res.ok) {
-          msg.className = 'err';
-          msg.textContent = data.detail || 'Upload failed.';
-          return;
-        }
         datasetId = data.dataset_id;
-        document.getElementById('dsid').textContent = datasetId;
-        msg.textContent = `Ingested ${data.rows_ingested} rows.`;
+        $('dsid').textContent = datasetId;
+        say('uploadMsg', `Ingested ${data.rows_ingested} rows.`, 'ok');
       } catch (e) {
-        msg.className = 'err';
-        msg.textContent = 'Could not reach the server.';
+        say('uploadMsg', 'Could not reach the server.', 'err');
       }
+    }
+
+    // ---------- validate + report ----------
+    function useId() {
+      const v = $('manualId').value;
+      if (!v) { say('validateMsg', 'Enter a dataset id.', 'err'); return; }
+      datasetId = Number(v);
+      $('dsid').textContent = datasetId;
+      say('validateMsg', '', '');
     }
 
     async function validate() {
-      const msg = document.getElementById('validateMsg');
-      msg.className = '';
-      msg.textContent = '';
-      if (!datasetId) { msg.textContent = 'Upload a file first.'; return; }
+      say('validateMsg', '', '');
+      if (!datasetId) { say('validateMsg', 'Upload a file first, or enter an existing id.', 'err'); return; }
       try {
         const v = await fetch(`${API}/datasets/${datasetId}/validate`, { method: 'POST' });
-        if (!v.ok) {
-          msg.className = 'err';
-          msg.textContent = 'Validation failed.';
-          return;
-        }
-        const report = await (await fetch(`${API}/datasets/${datasetId}/report`)).json();
-        const q = await (await fetch(`${API}/datasets/${datasetId}/quarantine`)).json();
+        if (!v.ok) { say('validateMsg', await readError(v, 'Validation failed.'), 'err'); return; }
+        const reportRes = await fetch(`${API}/datasets/${datasetId}/report`);
+        const qRes = await fetch(`${API}/datasets/${datasetId}/quarantine`);
+        if (!reportRes.ok || !qRes.ok) { say('validateMsg', 'Could not load the report.', 'err'); return; }
+        const report = await reportRes.json();
+        const q = await qRes.json();
 
-        document.getElementById('reportCard').style.display = 'block';
-        document.getElementById('score').textContent = `Health: ${report.health_score}%`;
-        document.getElementById('counts').textContent =
+        $('reportCard').style.display = 'block';
+        $('score').textContent = `Health: ${report.health_score}%`;
+        $('counts').textContent =
           `Total ${report.total_rows} · Valid ${report.valid} · Invalid ${report.invalid}`;
-        document.getElementById('common').textContent =
-          `Most common error: ${report.most_common_error || 'none'}`;
+        $('common').textContent = `Most common error: ${report.most_common_error || 'none'}`;
 
-        if (q.length === 0) {
-          document.getElementById('quarantine').textContent = 'No quarantined rows.';
-          return;
-        }
+        if (q.length === 0) { $('quarantine').textContent = 'No quarantined rows.'; return; }
         let html = '<table><tr><th>Row</th><th>Data</th><th>Reasons</th></tr>';
         for (const row of q) {
-          const reasons = row.reasons.map(r => `${r.column}: ${r.detail}`).join('; ');
+          const reasons = row.reasons.map((r) => `${r.column}: ${r.detail}`).join('; ');
           html += `<tr><td>${row.row_number}</td><td>${esc(JSON.stringify(row.data))}</td><td>${esc(reasons)}</td></tr>`;
         }
-        html += '</table>';
-        document.getElementById('quarantine').innerHTML = html;
+        $('quarantine').innerHTML = html + '</table>';
       } catch (e) {
-        msg.className = 'err';
-        msg.textContent = 'Could not reach the server.';
+        say('validateMsg', 'Could not reach the server.', 'err');
       }
     }
+
+    loadRules();
   </script>
 </body>
 </html>

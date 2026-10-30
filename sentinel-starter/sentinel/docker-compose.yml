@@ -17,6 +17,8 @@ services:
 
   app:
     build: .
+    # Development only: hot-reload. The Dockerfile's own CMD (no reload) is what runs in the cloud.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     environment:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-sentinel}:${POSTGRES_PASSWORD:-sentinel}@db:5432/${POSTGRES_DB:-sentinel}
     ports:

@@ -42,6 +42,10 @@ def report(dataset_id: int, db: Session = Depends(get_db)):
 @router.get("/{dataset_id}/quarantine")
 def quarantine(dataset_id: int, limit: int = 50, offset: int = 0,
                db: Session = Depends(get_db)):
+    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if ds is None:
+        raise HTTPException(status_code=404, detail="dataset not found")
+
     rows = (db.query(Quarantine)
             .filter(Quarantine.dataset_id == dataset_id)
             .order_by(Quarantine.row_number)
